@@ -1,0 +1,296 @@
+diff --git a/app/Models/SwitchPort.php b/app/Models/SwitchPort.php
+index db06c21de..3571ad6de 100644
+--- a/app/Models/SwitchPort.php
++++ b/app/Models/SwitchPort.php
+@@ -447,8 +447,10 @@ class SwitchPort extends Model
+      *
+      * @throws
+      */
+-    public function snmpUpdate( SNMP $host, bool $logger = false, bool $nosave = false ): static
++    public function snmpUpdate( SNMP $host, bool $logger = false, bool $nosave = false, ?string $entityMedia = null, bool $opticDiscoveryFailed = false ): static
+     {
++        $previousMauType = $this->mauType;
++
+         foreach( self::$SNMP_MAP as $snmp => $attribute ) {
+ 
+             switch( $snmp ) {
+@@ -533,6 +535,42 @@ class SwitchPort extends Model
+ 
+         } catch( \Exception $e ){}
+ 
++        // Use ENTITY-MIB only when MAU cannot identify the media.
++        if (
++            $entityMedia !== null
++            && (
++                $this->mauType === '(empty)'
++                || str_starts_with(
++                    $this->mauType ?? '',
++                    '(unknown type - oid:'
++                )
++            )
++        ) {
++            if ($previousMauType !== $entityMedia && $logger) {
++                Log::info(
++                    "[{$this->switcher->name}]:{$this->name} "
++                    . "ENTITY-MIB media changed from "
++                    . "[{$previousMauType}] to [{$entityMedia}]"
++                );
++            }
++
++            $this->mauType = $entityMedia;
++
++        } elseif (
++            $opticDiscoveryFailed
++            && $this->mauType === '(empty)'
++            && is_string($previousMauType)
++            && $previousMauType !== ''
++            && $previousMauType !== '(empty)'
++            && !str_starts_with(
++                $previousMauType,
++                '(unknown type - oid:'
++            )
++        ) {
++            // Preserve a previously known value during discovery failure.
++            $this->mauType = $previousMauType;
++        }
++
+         $this->lastSnmpPoll = now();
+ 
+         if( !$nosave ) {
+diff --git a/app/Models/Switcher.php b/app/Models/Switcher.php
+index e9e914e24..5b4068ea1 100644
+--- a/app/Models/Switcher.php
++++ b/app/Models/Switcher.php
+@@ -387,6 +387,50 @@ class Switcher extends Model
+         // clone the ports currently known to this switch as we'll be playing with this array
+         $existingPorts = clone $this->switchPorts;
+ 
++        // Optional Arista ENTITY-MIB media discovery.
++        $opticMedia = [];
++        $opticDiscoveryFailed = false;
++
++        if (
++            config('optics.enabled', false)
++            && in_array(
++                (int) $this->id,
++                array_map(
++                    'intval',
++                    array_filter(
++                        array_map(
++                            'trim',
++                            explode(
++                                ',',
++                                (string) (
++                                    config('optics.switch_ids')
++                                    ?: config('optics.switch_id', 0)
++                                )
++                            )
++                        ),
++                        fn($id) => ctype_digit($id) && (int) $id > 0
++                    )
++                ),
++                true
++            )
++            && strcasecmp(trim($this->vendor?->name ?? ''), 'Arista') === 0
++        ) {
++            $discovery = \IXP\Optics\TransceiverDiscovery::discoverWithStatus(
++                $host,
++                true
++            );
++
++            $opticMedia = $discovery['media'];
++            $opticDiscoveryFailed = !$discovery['success'];
++
++            if ($opticDiscoveryFailed) {
++                Log::warning(
++                    "ENTITY-MIB discovery failed for {$this->name}: "
++                    . ($discovery['error'] ?? 'Unknown error')
++                );
++            }
++        }
++
+         $foundIfIndexes = [];
+ 
+         // iterate over all the ports discovered on the switch:
+@@ -444,7 +488,32 @@ class Switcher extends Model
+             }
+ 
+             // update / set port details from SNMP
+-            $sp->snmpUpdate( $host, $logger, $nosave );
++            $ifName = $host->useIface()->names()[$index] ?? '';
++            $entityMedia = null;
++
++            // Match exact interface or its immediate physical parent.
++            // Never climb multiple levels in the interface hierarchy.
++            if (preg_match('/^Ethernet[0-9]+(?:\/[0-9]+)*$/', $ifName)) {
++                if (isset($opticMedia[$ifName])) {
++                    $entityMedia = $opticMedia[$ifName];
++                } elseif (str_contains($ifName, '/')) {
++                    $parent = substr(
++                        $ifName,
++                        0,
++                        strrpos($ifName, '/')
++                    );
++
++                    $entityMedia = $opticMedia[$parent] ?? null;
++                }
++            }
++
++            $sp->snmpUpdate(
++                $host,
++                $logger,
++                $nosave,
++                $entityMedia,
++                $opticDiscoveryFailed
++            );
+         }
+ 
+         if( $existingPorts->count() ) {
+diff --git a/app/Optics/AristaTransceiverParser.php b/app/Optics/AristaTransceiverParser.php
+new file mode 100644
+index 000000000..36b3f03d0
+--- /dev/null
++++ b/app/Optics/AristaTransceiverParser.php
+@@ -0,0 +1,55 @@
++<?php
++
++namespace IXP\Optics;
++
++class AristaTransceiverParser
++{
++    /**
++     * Parse ENTITY-MIB descriptions into physical-port media mappings.
++     *
++     * @param array $descriptions entPhysicalDescr records
++     * @return array<string, string>
++     */
++    public static function parse(array $descriptions): array
++    {
++        $result = [];
++        $conflicts = [];
++
++        foreach ($descriptions as $description) {
++            if (!is_string($description)) {
++                continue;
++            }
++
++            if (!preg_match(
++                '~^Xcvr for (Ethernet[0-9]+(?:/[0-9]+)*):.*?\bmedia\s+([A-Za-z0-9][A-Za-z0-9._+-]*)\s*$~i',
++                trim($description),
++                $matches
++            )) {
++                continue;
++            }
++
++            $port = $matches[1];
++            $media = $matches[2];
++
++            // Ignore switch-reported unknown optical classifications.
++            if (preg_match('/^Unknown(?:Optical.*)?$/i', $media)) {
++                continue;
++            }
++
++            if (isset($result[$port]) && $result[$port] !== $media) {
++                $conflicts[$port] = true;
++                continue;
++            }
++
++            if (!isset($conflicts[$port])) {
++                $result[$port] = $media;
++            }
++        }
++
++        foreach (array_keys($conflicts) as $port) {
++            unset($result[$port]);
++        }
++
++        return $result;
++    }
++}
+diff --git a/app/Optics/TransceiverDiscovery.php b/app/Optics/TransceiverDiscovery.php
+new file mode 100644
+index 000000000..928bb3da2
+--- /dev/null
++++ b/app/Optics/TransceiverDiscovery.php
+@@ -0,0 +1,65 @@
++<?php
++
++namespace IXP\Optics;
++
++use OSS_SNMP\SNMP;
++
++class TransceiverDiscovery
++{
++    /**
++     * Discover transceiver media from Arista ENTITY-MIB.
++     *
++     * Distinguishes successful empty inventory from polling failure.
++     *
++     * @return array{success: bool, media: array<string,string>, error: ?string}
++     */
++    public static function discoverWithStatus(
++        SNMP $host,
++        bool $isArista
++    ): array {
++        if (!$isArista) {
++            return [
++                'success' => false,
++                'media' => [],
++                'error' => 'Unsupported vendor',
++            ];
++        }
++
++        try {
++            $descriptions = $host->useEntity()->physicalDescription();
++
++            if (!is_array($descriptions)) {
++                return [
++                    'success' => false,
++                    'media' => [],
++                    'error' => 'Invalid ENTITY-MIB response',
++                ];
++            }
++
++            return [
++                'success' => true,
++                'media' => AristaTransceiverParser::parse($descriptions),
++                'error' => null,
++            ];
++
++        } catch (\Throwable $e) {
++            return [
++                'success' => false,
++                'media' => [],
++                'error' => 'SNMP ENTITY-MIB query failed',
++            ];
++        }
++    }
++
++    /**
++     * Backward-compatible discovery method.
++     *
++     * @return array<string,string>
++     */
++    public static function discover(
++        SNMP $host,
++        bool $isArista
++    ): array {
++        return self::discoverWithStatus($host, $isArista)['media'];
++    }
++}
+diff --git a/config/optics.php b/config/optics.php
+new file mode 100644
+index 000000000..a30da9726
+--- /dev/null
++++ b/config/optics.php
+@@ -0,0 +1,10 @@
++<?php
++
++return [
++    'enabled' => env('IXPM_OPTICS_ENABLED', false),
++    'switch_id' => env('IXPM_OPTICS_SWITCH_ID', 0),
++
++    // Optional comma-separated list of enabled switch IDs.
++    'switch_ids' => env('IXPM_OPTICS_SWITCH_IDS', ''),
++
++];
